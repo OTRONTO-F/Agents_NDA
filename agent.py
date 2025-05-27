@@ -130,7 +130,12 @@ class GoogleDriveService:
             search_query = (
                 "name contains 'Guidelines' or "
                 "name contains 'Review' or "
-                "name contains 'Amendment'"
+                "name contains 'Amendment' or "
+                "name contains 'Original' or "
+                "name contains 'พรบจัดซื้อ.pdf' or "
+                "name contains 'PUBLIC PROCUREMENT AND SUPPLIES ADMINISTRATION ACT' or "
+                "name contains 'PUBLIC PROCUREMENT AND SUPPLIES ADMINISTRATION ACT' or "
+                "name contains 'PROCUREMENT' or "
             )
             
             results = self.service.files().list(
