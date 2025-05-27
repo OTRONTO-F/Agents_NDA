@@ -128,14 +128,15 @@ class GoogleDriveService:
         try:
             # Search for guideline documents
             search_query = (
-                "name contains 'Guidelines' or "
-                "name contains 'Review' or "
-                "name contains 'Amendment' or "
-                "name contains 'Original' or "
-                "name contains 'พรบจัดซื้อ.pdf' or "
-                "name contains 'PUBLIC PROCUREMENT AND SUPPLIES ADMINISTRATION ACT' or "
-                "name contains 'PUBLIC PROCUREMENT AND SUPPLIES ADMINISTRATION ACT' or "
+                "name contains 'Guideline' or "
+                "name contains 'NDA' or "
                 "name contains 'PROCUREMENT' or "
+                "name contains 'Rules' or "
+                "name contains 'Contract' or "
+                "name contains 'Act' or "
+                "name contains 'Reviewing' or "
+                "name contains 'Amendment' or "
+                "name contains 'Original'"
             )
             
             results = self.service.files().list(
@@ -223,7 +224,7 @@ class GoogleDriveService:
         
         return response
 
-    def list_nda_files(self) -> str:
+    def list_nda_files(self, folder_id: Optional[str] = None) -> str:
         """
         List all NDA-related files from Google Drive.
         
@@ -237,6 +238,10 @@ class GoogleDriveService:
                 "name contains 'Non-Disclosure' or "
                 "name contains 'confidential'"
             )
+            
+            # Add folder specific search if folder_id is provided
+            if folder_id:
+                search_query = f"{search_query} and '{folder_id}' in parents"
             
             results = self.service.files().list(
                 q=search_query,
@@ -256,7 +261,7 @@ class GoogleDriveService:
                     f"   Modified: {file.get('modifiedTime', 'Unknown')[:10]}\n"
                     f"   Link: {file.get('webViewLink', 'No link available')}\n"
                     f"   Type: {file.get('mimeType', 'Unknown')}\n"
-                    f"   Size: {self._format_size(file.get('size', 0))}\n\n"
+                    f"   Size: {self._format_size(int(file.get('size', 0)))}\n\n"
                 )
             
             response += "\nTo view a file's content, use the command: 'view file [number]'"
