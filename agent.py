@@ -340,12 +340,50 @@ class GoogleDriveService:
             _, done = downloader.next_chunk()
             
         fh.seek(0)
-        reader = PyPDF2.PdfReader(fh)
         text = ""
-        
-        for page in reader.pages:
-            text += page.extract_text() or ""
-            
+        try:
+            # Try extracting text using PyPDF2
+            reader = PyPDF2.PdfReader(fh)
+            for page in reader.pages:
+                text += page.extract_text() or ""
+
+            # If standard text extraction is minimal or failed, attempt OCR
+            if not text or len(text.strip()) < 50:
+                logger.info(f"Minimal text extracted from {file_id} with PyPDF2, attempting OCR.")
+                fh.seek(0) # Reset stream position to read for OCR
+                # --- OCR Implementation Needed Here ---
+                # This section requires an OCR library (e.g., pytesseract) and potentially a PDF-to-image converter (e.g., pdf2image).
+                # Example (conceptual, requires libraries and setup):
+                # try:
+                #     from PIL import Image
+                #     import pytesseract
+                #     from pdf2image import convert_from_bytes
+                #     
+                #     images = convert_from_bytes(fh.read())
+                #     ocr_text = ""
+                #     for i, image in enumerate(images):
+                #         ocr_text += pytesseract.image_to_string(image, lang='tha+eng') # Specify languages if needed
+                #         ocr_text += "\n" # Add newline between pages
+                #     text = ocr_text if ocr_text.strip() else "[OCR could not extract text]"
+                #     if text.strip() == "[OCR could not extract text]":
+                #          logger.warning(f"OCR failed to extract text for {file_id}.")
+                #     else:
+                #          logger.info(f"OCR successfully extracted text for {file_id}.")
+                #
+                # except ImportError:
+                #     logger.error("Required libraries for OCR (e.g., pytesseract, pdf2image, PIL) not installed.")
+                #     text = "[Error: Required libraries for OCR not installed.]"
+                # except Exception as ocr_e:
+                #     logger.error(f"Error during OCR processing for {file_id}: {ocr_e}")
+                #     text = f"[Error during OCR: {ocr_e}]"
+                
+                # Placeholder text if OCR is not implemented or fails
+                if not text or text.strip() == "[OCR could not extract text]" or text.startswith("[Error"): # Check if OCR attempt was successful or implemented
+                     text = "[Content could not be extracted. It might be an image-based PDF without selectable text, and OCR is not fully implemented or failed.]"
+
+
+        except Exception as e:
+            logger.error(f"Error getting PDF content for {file_id} with PyPDF2: {e}")
         return text if text else "[No extractable text in PDF]"
 
     def _get_google_apps_content(self, file_id: str, mime_type: str) -> str:
@@ -526,9 +564,11 @@ When a user wants to analyze documents:
    - Use 'list_nda_files' to show available NDA documents.
    - Let user select which document to analyze using 'view_file'.
    - After using 'view_file', present the content received from the tool to the user in the chat.
-   - User provides content or confirms file from 'view_file' for analysis. **Before calling the analysis tool, check if guidelines are loaded. If guidelines are loaded, explicitly state that you will now analyze the document using the provided content and the loaded guidelines, then proceed to use 'get_analysis_context'. If no guidelines are loaded, explicitly inform the user that only standard criteria will be used and ASK IF THEY WANT TO LOAD GUIDELINES using the 'Load guidelines' command BEFORE PROCEEDING with the analysis. Wait for their response. If they confirm to proceed without guidelines or don't respond about guidelines, then use 'get_analysis_context' with the document content.** Use the output from 'get_analysis_context' and the ANALYSIS OUTPUT FORMAT instructions below to perform the analysis and present the results.
+   - User provides content or confirms file from 'view_file' for analysis. **Once the NDA content is available (either from a viewed file or pasted/uploaded text), ASK THE USER TO SPECIFY THE LEGAL SYSTEM FOR COMPARISON: "Thailand" or "Singapore". Wait for their response.**
+   - **After the legal system is specified, before calling the analysis tool, check if guidelines are loaded.** If guidelines are loaded, explicitly state that you will now analyze the document using the provided content and the loaded guidelines, then proceed to use 'get_analysis_context'. If no guidelines are loaded, explicitly inform the user that only standard criteria will be used and ASK IF THEY WANT TO LOAD GUIDELINES using the 'Load guidelines' command BEFORE PROCEEDING with the analysis. Wait for their response. If they confirm to proceed without guidelines or don't respond about guidelines, then use 'get_analysis_context' with the document content.** Use the output from 'get_analysis_context' and the ANALYSIS OUTPUT FORMAT instructions below to perform the analysis and present the results.
 3. For local files:
-   - User provides content or uploads a file for analysis. **Before calling the analysis tool, check if guidelines are loaded. If guidelines are loaded, explicitly state that you will now analyze the document using the provided content and the loaded guidelines, then proceed to use 'get_analysis_context'. If no guidelines are loaded, explicitly inform the user that only standard criteria will be used and ASK IF THEY WANT TO LOAD GUIDELINES using the 'Load guidelines' command BEFORE PROCEEDING with the analysis. Wait for their response. If they confirm to proceed without guidelines or don't respond about guidelines, then use 'get_analysis_context' tool with the document content.** Use the output from 'get_analysis_context' and the ANALYSIS OUTPUT FORMAT instructions below to perform the analysis and present the results.
+   - User provides content or uploads a file for analysis. **Once the NDA content is available (either from a viewed file or pasted/uploaded text), ASK THE USER TO SPECIFY THE LEGAL SYSTEM FOR COMPARISON: "Thailand" or "Singapore". Wait for their response.**
+   - **After the legal system is specified, before calling the analysis tool, check if guidelines are loaded.** If guidelines are loaded, explicitly state that you will now analyze the document using the provided content and the loaded guidelines, then proceed to use 'get_analysis_context'. If no guidelines are loaded, explicitly inform the user that only standard criteria will be used and ASK IF THEY WANT TO LOAD GUIDELINES using the 'Load guidelines' command BEFORE PROCEEDING with the analysis. Wait for their response. If they confirm to proceed without guidelines or don't respond about guidelines, then use 'get_analysis_context' with the document content.** Use the output from 'get_analysis_context' and the ANALYSIS OUTPUT FORMAT instructions below to perform the analysis and present the results.
    - Process uploaded files directly.
 4. Apply relevant guidelines for analysis:
    - Use 'load_guidelines' to load guideline documents.
