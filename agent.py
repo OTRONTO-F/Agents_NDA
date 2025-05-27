@@ -455,11 +455,13 @@ class GoogleDriveService:
             # Get file content
             content = self.get_file_content(file_id)
             
+            # Basic formatting for readability: ensure paragraph breaks and strip whitespace
+            formatted_content = ''.join([line.strip() + '\n' for line in content.splitlines()])
+            formatted_content = formatted_content.replace('\n\n\n', '\n\n') # Reduce multiple newlines to double newlines
+
             response = (
                 f"Content of file: {file_name}\n\n"
-                f"--- Content Start ---\n"
-                f"{content}\n"
-                f"--- Content End ---\n"
+                f"```\n{formatted_content}\n```\n"
             )
             
             return response
@@ -575,39 +577,45 @@ When a user wants to analyze documents:
    - Use 'get_guideline_content' to access guideline content (primarily for preview). The loaded guidelines will be automatically included in the context provided by the 'get_analysis_context' tool when you analyze a document.
 
 ANALYSIS OUTPUT FORMAT:
-Organize your output into the following sections:
+Organize your output into the following sections using clear Markdown formatting for maximum readability:
 
-1. 🚫 Violations Identified
-   - List all paragraphs that violate the provided rules.
-   - Use bullet points for each violation.
-   - Clearly label:
-     * Original NDA text
-     * Explanation of violation
-     * Reference to the rule: **Refer to the specific guideline document used (e.g., 'Guideline: [Guideline Name] (Type: [Guideline Type])' ) and if possible, the relevant section or rule number within that guideline.**
-   - **Use bold text for key terms or phrases in the violation.**
+### 🚫 Violations Identified
+- List each violation clearly.
+- Use bullet points (`- `) for each violation.
+- For each violation, include:
+  - **Original Text**: [Quote the problematic content]
+  - **Explanation**: [Explain why the text violates the rule, citing the specific guideline document and rule if possible]
+  - **Reference**: [Specify the guideline document and any relevant section/rule number, e.g., `Guideline: [Guideline Name] (Type: [Guideline Type]), Rule X`]
 
-2. 🤔 Unclear or Unreasonable Clauses
-   - List any clauses that are ambiguous, contradictory, or illogical.
-   - Use bullet points for each clause.
-   - Clearly label:
-     * Original text
-     * Explanation of why it's problematic
-     * Optional suggestion or rewrite.
-   - **Use bold text for key terms or phrases in the problematic clause.**
+---
 
-3. ✅ Corrected Clauses
-   - Provide rewritten versions of all problematic clauses.
-   - Use bullet points for each corrected clause.
-   - Format:
-     * Original Clause: [Insert original paragraph]
-     * Rewritten Clause: [Insert corrected version based on rules or clarity]
-   - **Use bold text to highlight changes in the rewritten clause.**
+### 🤔 Unclear or Unreasonable Clauses
+- List each unclear or unreasonable clause.
+- Use bullet points (`- `) for each clause.
+- For each clause, include:
+  - **Original Text**: [Quote the problematic content]
+  - **Explanation**: [Explain why the text is ambiguous, contradictory, or illogical]
+  - **Suggestion**: [Optional: Provide a suggestion or rewrite for clarity]
 
-4. 📊 Summary
-   - Total rule violations found.
-   - Total unclear/unreasonable clauses found.
-   - Recommendation on whether the NDA is usable after correction.
-   - Provide a clear overall assessment.
+---
+
+### ✅ Corrected Clauses
+- Provide rewritten versions for problematic clauses.
+- Use bullet points (`- `) for each corrected clause.
+- Format each entry as:
+  - **Original Clause**: [Insert original paragraph]
+  - **Rewritten Clause**: [Insert corrected version based on rules or clarity, highlight changes using **bold text**]
+
+---
+
+### 📊 Summary
+- Provide a concise summary of the analysis.
+- Include:
+  - Total rule violations found.
+  - Total unclear/unreasonable clauses found.
+  - Overall assessment and recommendation on whether the NDA is usable after corrections.
+
+---
 
 COMMANDS YOU UNDERSTAND:
 - "List NDA files" - Use list_nda_files to show available NDA documents.
