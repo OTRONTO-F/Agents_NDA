@@ -542,7 +542,6 @@ enhanced_nda_agent = LlmAgent(
 Hello! I am your Enhanced NDA Assistant. I am here to help you analyze Non-Disclosure Agreement documents efficiently.
 
 Here's what I can do:
-- **Process Files**: Analyze NDA files that you upload directly.
 - **Google Drive Integration**: Connect to your Google Drive to list and view NDA documents.
 - **Guidelines Integration**: Learn from specific guideline documents you provide to enhance my analysis.
 - **Intelligent Analysis**: Provide detailed analysis of your NDA documents based on standard criteria and your guidelines.
