@@ -169,9 +169,18 @@ class GoogleDriveService:
             self.guidelines.clear()
             loaded_count = 0
             
+            guidelines_to_cache = {}
+
             for file in files:
                 try:
                     content = self.get_file_content(file["id"])
+                    
+                    # --- Modified: Check for error in content before creating GuidelineInfo ---
+                    if content.startswith("[Error reading file:") or content.startswith("[Error exporting Google Apps file:") or content.startswith("[Error during OCR:") or content.startswith("[Error: Required libraries for OCR not installed.]"): # Check for known error prefixes
+                        logger.warning(f"Skipping guideline file {file['name']} due to content error: {content}")
+                        continue # Skip this file if content has an error
+                    # --- End Modified ---
+
                     guideline = GuidelineInfo(
                         id=file["id"],
                         name=file["name"],
@@ -180,13 +189,16 @@ class GoogleDriveService:
                         type=self._determine_guideline_type(file["name"]),
                     )
                     self.guidelines[file["id"]] = guideline
+                    guidelines_to_cache[file["id"]] = guideline.__dict__ # Prepare for caching
                     loaded_count += 1
                 except Exception as e:
                     logger.error(f"Error processing guideline file {file['name']}: {e}")
                     continue
 
             # Update cache in session state (Store as dictionary for pickling/serialization safety)
-            state[cache_key] = {k: guideline.__dict__ for k, guideline in self.guidelines.items()}
+            # --- Modified: Cache only successfully loaded guidelines ---
+            state[cache_key] = guidelines_to_cache
+            # --- End Modified ---
             state['guidelines_cache_time'] = datetime.now().timestamp()
 
             return f"Successfully loaded {loaded_count} guideline documents."
@@ -231,7 +243,20 @@ class GoogleDriveService:
                 return f"Error loading guidelines: {status}"
 
         response = "Available Guidelines:\n\n"
-        for guideline in self.guidelines.values():
+        
+        # --- Modified: Only include guidelines with valid content ---
+        valid_guidelines = [g for g in self.guidelines.values() if not (
+            g.content.startswith("[Error reading file:") or 
+            g.content.startswith("[Error exporting Google Apps file:") or 
+            g.content.startswith("[Error during OCR:") or 
+            g.content.startswith("[Error: Required libraries for OCR not installed.]")
+        )]
+
+        if not valid_guidelines:
+             return "No valid guidelines loaded or available. Please try loading guidelines again."
+
+        for guideline in valid_guidelines:
+        # --- End Modified ---
             if guideline_type and guideline.type != guideline_type: # Check type here
                 continue
 
@@ -359,6 +384,40 @@ class GoogleDriveService:
             logger.error(f"Error getting file content: {e}")
             return f"[Error reading file: {str(e)}]"
 
+    def _export_google_apps_content(self, file_id: str, mime_type: str) -> str:
+        """
+        Export content from a Google Apps file (Docs, Sheets, etc.).
+
+        Args:
+            file_id (str): ID of the Google Apps file
+            mime_type (str): MIME type of the file
+
+        Returns:
+            str: Exported content
+        """
+        try:
+            if "document" in mime_type:
+                export_mime_type = "text/plain"
+            elif "spreadsheet" in mime_type:
+                export_mime_type = "text/csv"
+            # Add more mime types if needed (e.g., "text/html" for Slides)
+            else:
+                export_mime_type = "text/plain" # Default export type
+
+            content = (
+                self.service.files()
+                .export(fileId=file_id, mimeType=export_mime_type)
+                .execute()
+            )
+            return content.decode("utf-8", errors="ignore")
+
+        except HttpError as error:
+            logger.error(f"HTTP Error exporting Google Apps file {file_id}: {error}")
+            return f"[Error exporting Google Apps file: {error}]"
+        except Exception as e:
+            logger.error(f"Error exporting Google Apps file {file_id}: {e}")
+            return f"[Error exporting Google Apps file: {e}]"
+
     def _get_pdf_content(self, file_id: str) -> str:
         """
         Get content from a PDF file.
@@ -428,35 +487,6 @@ class GoogleDriveService:
         except Exception as e:
             logger.error(f"Error getting PDF content for {file_id} with PyPDF2: {e}")
         return text if text else "[No extractable text in PDF]"
-
-    def _get_google_apps_content(self, file_id: str, mime_type: str) -> str:
-        """
-        Get content from a Google Apps file (Docs, Sheets, etc.) or exported Excel file.
-
-        Args:
-            file_id (str): ID of the Google Apps or Excel file
-            mime_type (str): MIME type of the file
-
-        Returns:
-            str: Exported content from Google Apps or Excel file
-        """
-        if "document" in mime_type:
-            export_mime_type = "text/plain"
-        elif "spreadsheet" in mime_type or mime_type in [
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",  # .xlsx
-            "application/vnd.ms-excel",  # .xls
-        ]:
-            export_mime_type = "text/csv"
-        else:
-            # Default or handle other Google Apps types if necessary, though text/plain is common
-            export_mime_type = "text/plain"
-
-        content = (
-            self.service.files()
-            .export(fileId=file_id, mimeType=export_mime_type)
-            .execute()
-        )
-        return content.decode("utf-8", errors="ignore")
 
     def _get_excel_content_via_openpyxl(self, file_id: str) -> Dict[str, Any]:
         """
@@ -1021,6 +1051,8 @@ How I work:
 2. I use my knowledge and the provided context to perform a detailed analysis.
 3. I structure the analysis results according to the defined output format.
 
+**IMPORTANT: You MUST follow the Output Format below PRECISELY. Use Markdown heavily for clear and beautiful formatting (bolding, lists, code blocks, etc.). Maintain consistent structure and formatting for all sections.**
+
 Output Format:
 ---
 📋 **NDA Analysis Report**
@@ -1049,7 +1081,7 @@ Output Format:
 ---
 
 🚨 **Violations Identified**:
-(List of violations found, if any. If none, state "None identified.")
+(List of violations found, if any. If none, state "None identified." Use bullet points for each violation.)
 
 * **[Violation Type/Summary]**: [Brief description]
   > **Original Text**:
@@ -1071,7 +1103,7 @@ Output Format:
 ---
 
 🤔 **Unclear or Unreasonable Clauses**:
-(List of unclear/unreasonable clauses found, if any. If none, state "None identified.")
+(List of unclear/unreasonable clauses found, if any. If none, state "None identified." Use bullet points for each clause.)
 
 * **[Issue Type/Summary]**: [Brief description]
   > **Original Text**:
@@ -1096,7 +1128,7 @@ Output Format:
 ---
 
 🔍 **Key Findings**:
-(Summary of key points from the analysis, often pulled from Violations, Unclear Clauses, and Missing Sections. If none, state "No significant findings.")
+(Summary of key points from the analysis, often pulled from Violations, Unclear Clauses, and Missing Sections. If none, state "No significant findings." Use bullet points for findings.)
 
 * [Finding 1]
 * [Finding 2]
@@ -1105,7 +1137,7 @@ Output Format:
 ---
 
 ⚠️ **Critical Issues**:
-(High-risk issues or critical problems that need addressing. If none, state "None identified.")
+(High-risk issues or critical problems that need addressing. If none, state "None identified." Use bullet points for issues.)
 
 * [Issue 1]
 * [Issue 2]
@@ -1114,7 +1146,7 @@ Output Format:
 ---
 
 💡 **Recommendations**:
-(General suggestions for improving the document. Provide at least 2-3 recommendations even if the score is high.)
+(General suggestions for improving the document. Provide at least 2-3 recommendations even if the score is high. Use bullet points for recommendations.)
 
 * [Recommendation 1]
 * [Recommendation 2]
@@ -1123,32 +1155,32 @@ Output Format:
 ---
 
 📊 **Completeness Check**:
-(Status of essential standard NDA clauses: Present/Missing)
+(Status of essential standard NDA clauses: ✅ Present / ❌ Missing) Use a clear list format.
 **IMPORTANT:** Ensure this list is consistent with the 'Missing Sections' below.
 
-* Definition of Confidential Information: Present/Missing
-* Obligations of Receiving Party: Present/Missing
-* Permitted Use: Present/Missing
-* Return of Information: Present/Missing
-* Term/Duration: Present/Missing
-* Remedies: Present/Missing
-* Governing Law: Present/Missing
-* Signatures: Present/Missing
-* Authorized Signatories Section: Present/Missing
+* ✅ / ❌ Definition of Confidential Information
+* ✅ / ❌ Obligations of Receiving Party
+* ✅ / ❌ Permitted Use
+* ✅ / ❌ Return of Information
+* ✅ / ❌ Term/Duration
+* ✅ / ❌ Remedies
+* ✅ / ❌ Governing Law
+* ✅ / ❌ Signatures
+* ✅ / ❌ Authorized Signatories Section
 
 ---
 
 🔍 **Template Comparison Results**:
 
 📋 **Missing Sections**:
-(Specific critical sections missing based on template comparison. If none, state "None identified.")
+(Specific critical sections missing based on template comparison. If none, state "None identified." Use bullet points for missing sections.)
 **IMPORTANT:** Ensure this list is consistent with the 'Completeness Check' above for missing items.
 * [Section 1]
   - Required elements: [List]
   - Impact: [Description]
 
 📋 **Extra Sections**:
-(Sections present in the document but not typically found in standard templates. If none, state "None identified.")
+(Sections present in the document but not typically found in standard templates. If none, state "None identified." Use bullet points for extra sections.)
 * [Section 1]
   - Assessment: [Description]
   - Recommendation: [Keep/Remove/Modify]
@@ -1220,14 +1252,23 @@ enhanced_nda_assistant = LlmAgent(
     name="enhanced_nda_assistant",
     model=MODEL_NAME,
     description="Main Assistant for handling user inquiries about NDAs and managing workflows for tasks like listing, viewing, guidelines, and analysis.",
-    instruction="""
-Hello! I am your Enhanced NDA Assistant, ready to assist you with Non-Disclosure Agreement documents 🤖📄. I can manage files from Google Drive, use guidelines for analysis, perform detailed analysis, and provide structured reports. Ready to assist you! 👍
+    instruction="""Introduce yourself to make it easier to use as follows:
+Hello! I am your Enhanced NDA Assistant, ready to assist you with Non-Disclosure Agreement documents 🤖📄.
+
+I can help you with Non-Disclosure Agreements. Here is what I can do:
+
+1.  List available NDA files from Google Drive.
+2.  View the content of a specific NDA file by its number.
+3.  Analyze an NDA document and provide a detailed report based on guidelines.
+4.  Show the loaded guidelines used for analysis.
+
+Just let me know what you'd like to do! 👍
 
 WORKFLOW FOR DOCUMENT ANALYSIS:
 - When a user asks to analyze an NDA document (by providing content or referring to previously viewed content), I will orchestrate the analysis process through these steps:
-  1. **Determine Legal System:** **FIRST**, I will check the session state for the key `legal_system`.
-     - If `legal_system` is found, I will use that system for analysis.
-     - If `legal_system` is NOT found, I MUST explicitly ask the user: "Do you want the analysis based on Thai or Singapore law?". I must wait for the user's response. Once the user responds with "Thai" or "Singapore", I will set the `legal_system` key in the session state to their choice and proceed. If the response is unclear, I will default to "Thai", set the state, and inform the user.
+  1. **Set Legal System:** I will automatically set the legal system to Thai Rules in the session state.
+     - Set `legal_system` key in session state to "Thai Rules"
+     - No need to ask the user about legal system choice
   2. **Load Guidelines:** I will delegate the task of loading guidelines to the `nda_guidelines_agent` by instructing it to "Load guidelines". I will wait for the result.
   3. **Check Guideline Status:** I will check the result from the `nda_guidelines_agent`. If guideline loading failed (indicated by an error message), I will report the error to the user and inform them that analysis cannot proceed.
   4. **Prepare Analysis Context:** If guidelines loaded successfully, I will use the `drive_service.get_analysis_context` tool, passing the NDA document content to prepare the full context for the analysis agent (this context will include both the NDA and the loaded guidelines).
