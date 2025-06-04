@@ -12,7 +12,7 @@ from typing import Dict, List, Optional, Any, Union
 # Third-party imports
 import PyPDF2
 from dotenv import load_dotenv
-from google.adk.agents import LlmAgent
+from google.adk.agents import LlmAgent, SequentialAgent
 from google.oauth2.service_account import Credentials as ServiceAccountCredentials
 from googleapiclient.discovery import build, Resource
 from googleapiclient.errors import HttpError
@@ -57,25 +57,13 @@ class GuidelineInfo:
 class GoogleDriveService:
     """
     Service class for Google Drive operations.
-
-    This class handles all interactions with Google Drive API, including:
-    - Authentication and service initialization
-    - File listing and searching
-    - File content retrieval
-    - Guidelines management
-
-    Attributes:
-        service: Google Drive API service instance
-        guidelines (Dict[str, GuidelineInfo]): Dictionary of loaded guidelines
+    Handles interactions with Google Drive API for document management.
     """
 
     def __init__(self, credentials_json: Optional[str] = None) -> None:
         """
         Initialize Google Drive service with credentials.
-
-        Args:
-            credentials_json (Optional[str]): Path to credentials JSON file or JSON string.
-                If None, uses CREDENTIALS_PATH from environment.
+        Only sets up the service connection.
         """
         self.service = self._initialize_service(credentials_json or CREDENTIALS_PATH)
         self.guidelines: Dict[str, GuidelineInfo] = {}
@@ -121,14 +109,35 @@ class GoogleDriveService:
             logger.error(f"Failed to initialize Google Drive service: {e}")
             raise
 
-    def load_guidelines(self) -> str:
+    def load_guidelines(self, tool_context) -> str:
         """
-        Load and process guideline documents from Google Drive.
+        Load guideline documents from Google Drive.
+        Uses ADK session state for caching.
+
+        Args:
+            tool_context: ADK ToolContext for session state access
 
         Returns:
             str: Status message about loaded guidelines
         """
         try:
+            # Check session state for cache
+            state = tool_context.state # Access state via tool_context
+            cache_key = 'guidelines_cache'
+            cache_time = state.get('guidelines_cache_time')
+            
+            # Use cache if available and not expired (1 hour)
+            if cache_key in state and cache_time:
+                if datetime.now().timestamp() - cache_time < 3600:  # 1 hour
+                    self.guidelines = state[cache_key]
+                    # Add guideline objects back to the instance dictionary
+                    for key, value in self.guidelines.items():
+                         if isinstance(value, dict):
+                              # Recreate GuidelineInfo object from dictionary if needed (depending on how it was stored)
+                              self.guidelines[key] = GuidelineInfo(**value)
+                    
+                    return f"Using cached guidelines (loaded {int((datetime.now().timestamp() - cache_time)/60)} minutes ago)"
+
             # Search for guideline documents
             search_query = (
                 "name contains 'Guideline' or "
@@ -153,17 +162,16 @@ class GoogleDriveService:
             )
 
             files = results.get("files", [])
-
             if not files:
                 return "No guideline documents found in Google Drive."
 
+            # Load guidelines
+            self.guidelines.clear()
             loaded_count = 0
+            
             for file in files:
                 try:
-                    # Get file content
                     content = self.get_file_content(file["id"])
-
-                    # Create guideline info
                     guideline = GuidelineInfo(
                         id=file["id"],
                         name=file["name"],
@@ -171,14 +179,15 @@ class GoogleDriveService:
                         last_updated=file.get("modifiedTime", ""),
                         type=self._determine_guideline_type(file["name"]),
                     )
-
-                    # Store in guidelines dictionary
                     self.guidelines[file["id"]] = guideline
                     loaded_count += 1
-
                 except Exception as e:
                     logger.error(f"Error processing guideline file {file['name']}: {e}")
                     continue
+
+            # Update cache in session state (Store as dictionary for pickling/serialization safety)
+            state[cache_key] = {k: guideline.__dict__ for k, guideline in self.guidelines.items()}
+            state['guidelines_cache_time'] = datetime.now().timestamp()
 
             return f"Successfully loaded {loaded_count} guideline documents."
 
@@ -203,23 +212,27 @@ class GoogleDriveService:
             return "amendment"
         return "general"
 
-    def get_guideline_content(self, guideline_type: Optional[str] = None) -> str:
+    def get_guideline_content(self, tool_context, guideline_type: Optional[str] = None) -> str:
         """
         Get content of guidelines, optionally filtered by type.
+        Will load guidelines if not in cache.
 
         Args:
+            tool_context: ADK ToolContext for session state access
             guideline_type (Optional[str]): Type of guidelines to retrieve
 
         Returns:
             str: Formatted guideline content
         """
+        # Load guidelines if not in cache (pass tool_context)
         if not self.guidelines:
-            return "No guidelines loaded. Please use 'load guidelines' command first."
+            status = self.load_guidelines(tool_context)
+            if "Error" in status:
+                return f"Error loading guidelines: {status}"
 
         response = "Available Guidelines:\n\n"
-
         for guideline in self.guidelines.values():
-            if guideline_type and guideline.type != guideline_type:
+            if guideline_type and guideline.type != guideline_type: # Check type here
                 continue
 
             response += (
@@ -323,17 +336,24 @@ class GoogleDriveService:
             file_metadata = self.service.files().get(fileId=file_id).execute()
             mime_type = file_metadata.get("mimeType", "")
 
-            if mime_type == "application/pdf":
-                return self._get_pdf_content(file_id)
-            elif "google-apps" in mime_type:
-                return self._get_google_apps_content(file_id, mime_type)
+            # Differentiate between native Google Workspace files and others
+            if mime_type.startswith("application/vnd.google-apps."):
+                # Native Google Docs, Sheets, Slides, etc. Use export.
+                logger.info(f"Exporting Google Workspace file {file_id} with mimeType {mime_type}")
+                return self._export_google_apps_content(file_id, mime_type)
+            elif mime_type == "application/pdf":
+                 logger.info(f"Getting PDF content for {file_id}")
+                 return self._get_pdf_content(file_id) # Already uses get_media
             elif mime_type in [
                 "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",  # .xlsx
                 "application/vnd.ms-excel",  # .xls
             ]:
-                return self._get_excel_content_via_openpyxl(file_id)
+                 logger.info(f"Getting Excel content for {file_id} with mimeType {mime_type} via openpyxl")
+                 return self._get_excel_content_via_openpyxl(file_id) # Already uses get_media
             else:
-                return self._get_other_content(file_id)
+                # Other file types (uploaded docs, plain text, etc.). Use get_media.
+                 logger.info(f"Getting generic file content for {file_id} with mimeType {mime_type} via get_media")
+                 return self._get_other_content(file_id) # Uses get_media
 
         except Exception as e:
             logger.error(f"Error getting file content: {e}")
@@ -839,6 +859,72 @@ General Analysis Criteria:
 # Create Google Drive Service instance
 drive_service = GoogleDriveService()
 
+# Modify functions to use ADK session state
+def guidelines_loaded(ctx) -> bool:
+    """
+    Check if guidelines are loaded using ADK session state.
+    Returns True if loaded, False otherwise.
+    """
+    state = ctx.session().state()
+    last_load_time = state.get('guidelines_last_load_time')
+    if not last_load_time:
+        return False
+    
+    current_time = datetime.now().timestamp()
+    cache_duration = 3600  # 1 hour
+    return (current_time - last_load_time) < cache_duration
+
+def ensure_guidelines(tool_context) -> tuple[bool, str]:
+    """
+    Ensure that guidelines are loaded using ADK session state.
+    Returns (True, message) if loaded, (False, error_message) if failed.
+    """
+    try:
+        # Check session state first
+        state = tool_context.state
+        
+        # Load guidelines (pass tool_context)
+        status = drive_service.load_guidelines(tool_context)
+        
+        if "Error" in status:
+            raise Exception(status)
+        
+        # Update session state
+        state['guidelines_loaded_status'] = True
+        state['guidelines_last_load_time'] = datetime.now().timestamp()
+        
+        return True, status
+    except Exception as e:
+        tool_context.state['guidelines_loaded_status'] = False
+        tool_context.state['guidelines_load_error'] = str(e)
+        return False, str(e)
+
+def handle_nda_analysis(tool_context, nda_content):
+    """
+    Trigger NDA analysis automatically when NDA content is provided.
+    Loads guidelines if needed, prepares context, and delegates to analysis agent.
+    Returns the analysis result or error message.
+    """
+    loaded, msg = ensure_guidelines(tool_context) # Pass tool_context
+    if loaded:
+        # Prepare context for analysis (must include both NDA content and guidelines)
+        analysis_context = drive_service.get_analysis_context(nda_content)
+        # Delegate to analysis agent with full context (assuming analysis agent tool also takes context if needed)
+        # For now, pass context to the tool call if the tool expects it.
+        # NOTE: If get_analysis_context tool itself needs session state, its signature must change.
+        # Assuming get_analysis_context doesn't need session state access directly for this call:
+        result = nda_analysis_agent.tools[0](analysis_context) # Pass context if tool expects it, otherwise just data
+        return result
+    else:
+        return f"ไม่สามารถโหลด Guidelines ได้: {msg}"
+
+# Example usage in workflow (pseudo-code):
+# When user uploads or selects a file, call handle_nda_analysis immediately
+# user_uploaded_file = ... (get from UI/event)
+# if user_uploaded_file:
+#     response = handle_nda_analysis(user_uploaded_file)
+#     print(response)  # or send to UI
+
 # --- Define Specialized Sub-Agents ---
 
 # Agent for listing NDA files
@@ -897,24 +983,23 @@ nda_guidelines_agent = LlmAgent(
     name="nda_guidelines_agent",
     model=MODEL_NAME,
     description="Agent specializing in loading and displaying guideline documents relevant to NDA analysis.",
-    instruction="""You are the NDA Guidelines Agent. Your SOLE purpose is to load guideline documents or display their content when explicitly instructed by the Main Agent or the user. You are a step in the workflow orchestrated by the Main Agent.
+    instruction="""You are the NDA Guidelines Agent. Your purpose is to load guideline documents or display their content when explicitly instructed by the Main Agent or the user.
 
-Follow these steps precisely:
+Follow these steps:
 
-1.  Receive the delegation or command, which will be either 'Load guidelines' or 'Show guidelines'.
-2.  **Execute Action**: Use the appropriate tool based on the command:
-    a.  If the command is 'Load guidelines', use the `load_guidelines` tool.
-    b.  If the command is 'Show guidelines', use the `get_guideline_content` tool.
-3.  **Handle Tool Output**: Carefully examine the result from the tool.
-    a.  **If the tool reports an Error**: Inform the user clearly about the error message received from the tool and state that the action could not be completed. Suggest they report this issue to the Main Assistant. **Signal completion** after reporting the error, returning control to the Main Agent.
-    b.  **If the tool returns Results**: Present the results (status message for loading, formatted content for showing) clearly to the user.
-4.  **Signal Completion**: After performing the requested action and presenting the result (or error), your task is complete. Do not attempt to interpret the user's next action or initiate analysis or other tasks. **Signal completion** after presenting the results, returning control to the Main Agent.
+1. Receive the command:
+   - 'Load guidelines' - Load guidelines (will use cache if available)
+   - 'Show guidelines' - Display current guidelines
+2. Execute Action:
+   - For 'Load guidelines': Use load_guidelines tool
+   - For 'Show guidelines': Use get_guideline_content tool
+3. Present results to user
 
 Available Tools:
-- load_guidelines: Use this tool to fetch and load guideline documents.
-- get_guideline_content: Use this tool to retrieve and display the content of currently loaded guidelines.
+- load_guidelines: Fetch and load guideline documents
+- get_guideline_content: Display currently loaded guidelines
 
-ERROR HANDLING: (Covered in step 3a) If either tool reports an error, inform the user clearly about the error and suggest they report it to the Main Assistant. **Signal completion** after reporting the error.
+Note: Guidelines are automatically cached for 1 hour.
 """,
     tools=[drive_service.load_guidelines, drive_service.get_guideline_content],
 )
@@ -924,84 +1009,170 @@ nda_analysis_agent = LlmAgent(
     name="nda_analysis_agent",
     model=MODEL_NAME,
     description="Specialized agent for comprehensive analysis and review of Non-Disclosure Agreement documents based on provided content and loaded guidelines, following a specific step-by-step workflow.",
-    instruction="""You are the NDA Analysis Support Agent. Your purpose is to perform detailed, expert analysis of NDA documents. You receive control from the Main Agent ONLY when the user's request is clearly about analyzing, reviewing, or checking an NDA document, AND the document content has already been provided or identified and passed to you.
+    instruction="""Hello! I am your NDA Analysis Assistant. I perform detailed analysis of NDA documents based on provided content, loaded guidelines, and templates.
 
-Your tasks, performed sequentially after receiving the document content, are:
+My role:
+- Analyze NDA document content against guidelines and templates.
+- Identify missing/extra sections, violations, and unclear clauses.
+- Provide structured analysis results, recommendations, and suggested corrections where applicable.
 
-1.  **Acknowledge Handover**: Start by acknowledging that you have taken over for NDA analysis and that you have received the document content. For example: "Okay, I have the document content now and will begin the analysis process."
-2.  **Ask Legal System**: **IMMEDIATELY after acknowledging handover, ASK THE USER TO SPECIFY THE LEGAL SYSTEM FOR COMPARISON: "Is the legal system for comparison Thailand or Singapore?". Wait for their explicit response.** Do NOT proceed until the user provides the legal system.
-3.  **Address Guidelines**: Once the user specifies the legal system, inform them about the guideline status before proceeding. You don't have a direct tool to check the internal state of the GoogleDriveService from here, but you should assume that if the user previously used the 'Load guidelines' command (handled by the Guidelines Agent), the guidelines are available to `get_analysis_context`. Based on whether you expect guidelines to be loaded, inform the user:
-    -   If guidelines are expected to be loaded: "Okay, I will now analyze the document using the provided content, focusing on [Specified Legal System], and applying the loaded guidelines."
-    -   If no guidelines are expected to be loaded (or if unsure, default to this): "Okay, I will now analyze the document using the provided content, focusing on [Specified Legal System]. No specific guidelines are currently loaded, so I will use general criteria. Would you like to load guidelines using the 'Load guidelines' command *before* I proceed with the analysis?" **Wait for their response.** If they explicitly confirm to proceed without guidelines, or if they do not respond after a reasonable pause, you may proceed.
-4.  **Prepare Context**: Use the `get_analysis_context` tool with the document content that was passed to you. This tool will combine the NDA content and any currently loaded guidelines into the input for the analysis.
-5.  **Perform Analysis**: Based on the output from `get_analysis_context` and the detailed ANALYSIS OUTPUT FORMAT instructions below, perform the comprehensive analysis.
-6.  **Present Results**: Present the analysis results clearly to the user, **STRICTLY following the ANALYSIS OUTPUT FORMAT and utilizing Markdown for excellent readability and visual appeal (headings, bullet points, bold text, etc.)**. Ensure sections are clearly delineated.
-7.  **Handle Follow-up**: Be ready to answer follow-up questions specifically related to the analysis or suggested changes. If the user asks about something outside of the analysis scope (e.g., listing files, loading different guidelines), recognize this and indicate that you need to transfer the conversation back to the Main Agent.
+How I work:
+1. I receive the NDA document content and loaded guidelines as input context.
+2. I use my knowledge and the provided context to perform a detailed analysis.
+3. I structure the analysis results according to the defined output format.
 
-Available Tools:
-- get_analysis_context: Use this tool with the document content to prepare the full context for analysis (combines NDA content and loaded guidelines). You will call this tool *after* the user specifies the legal system and guideline status is addressed.
+Output Format:
+---
+📋 **NDA Analysis Report**
 
-ANALYSIS OUTPUT FORMAT (STRICTLY ADHERE TO THIS MARKDOWN FORMATTING FOR READABILITY):
+📄 **Document Information**:
+* Type: [Document Type]
+* Date: YYYY-MM-DD (if found)
+* Parties: [Company A] and [Company B] (if found)
 
-### 🚫 Violations Identified
+📊 **Overall Assessment**:
+* **Status**: [Pass/Needs Improvement] (Based on severity and number of issues)
+* **Risk Level**: [Low/Medium/High] (Assess overall risk based on critical issues, violations, and missing clauses)
+* **Compliance Score**: X/100 (Calculate based on Compliance Score Criteria below. Provide a brief justification for the score.)
 
-- List each violation clearly using bullet points.
-- For each violation, include:
+**Compliance Score Criteria (Use these weights as a guide):**
+- Presence of all Essential Standard Clauses (Definition, Obligations, Term, Governing Law, Signatures): 50 points (Deduct points for each missing clause)
+- Absence of Critical Issues/Violations: 35 points (Deduct significant points for each critical issue or violation)
+- Clarity and Reasonableness of Clauses: 5 points (Deduct minor points for unclear or potentially unreasonable clauses)
+- Absence of Missing Critical Sections (from template comparison): 10 points (Deduct points for each missing critical section)
+- Aim for consistent scoring across similar documents.
 
-  - **Original Text**: [Quote the problematic content]<br>
-
-  - **Explanation**: [Explain why the text violates the rule, citing the specific guideline document and rule if possible]<br>
-
-  - **Reference**: [Specify the guideline document, any relevant section/rule number, **Page and Paragraph number (if found) - aim to include both if possible, using the format (Page Y, Paragraph Z)**]<br>
+* **Key Strengths**: (Summarize the well-drafted or compliant aspects)
+* **Key Weaknesses**: (Summarize the main areas needing improvement)
+* **Overall Conclusion**: (Provide a brief concluding statement summarizing the readiness or required actions for the document)
 
 ---
 
-### 🤔 Unclear or Unreasonable Clauses
+🚨 **Violations Identified**:
+(List of violations found, if any. If none, state "None identified.")
 
-- List each unclear or unreasonable clause using bullet points.
-- For each clause, include:
-
-  - **Original Text**: [Quote the problematic content]<br>
-
-  - **Explanation**: [Explain why the text is ambiguous, contradictory, or illogical]<br>
-
-  - **Suggestion**: [Optional: Provide a suggestion or rewrite for clarity]<br>
-
-  - **Reference**: [Specify any relevant guideline document and section/rule number, **Page and Paragraph number (if found) - aim to include both if possible, using the format (Page Z, Paragraph A)**]<br>
-
----
-
-### ✅ Corrected Clauses
-
-- Provide rewritten versions for problematic clauses using bullet points.
-- Format each entry as:
-
-  - **Original Clause**: [Insert original paragraph]<br>
-
-  - **Rewritten Clause**: [Insert corrected version based on rules or clarity, highlight changes using **bold text**]<br>
+* **[Violation Type/Summary]**: [Brief description]
+  > **Original Text**:
+  > ```
+  > [Relevant text from the document]
+  > ```
+  > **Explanation**:
+  >[Detailed explanation of the violation]
+  >
+  > **Legal Basis/Reference**:
+  > [Relevant legal principle or guideline reference]
+  >
+  > **Suggested Rewrite**:
+  > ```
+  >
+  > [Proposed rewritten clause, if applicable, otherwise "N/A"]
+  > ```
 
 ---
 
-### 📊 Completeness Check
+🤔 **Unclear or Unreasonable Clauses**:
+(List of unclear/unreasonable clauses found, if any. If none, state "None identified.")
 
-- Check for the presence of essential NDA clauses listed in the General Analysis Criteria (Definition of Confidential Information, Obligations of Receiving Party, Permitted Use, Return of Information, Term/Duration, Remedies, Governing Law, Signatures).
-- Use bullet points (`- `) for each clause.
-- Indicate whether the clause is **Present** or **Missing**. If Present, briefly mention where it is or its key aspect. If Missing, state that it is missing.
+* **[Issue Type/Summary]**: [Brief description]
+  > **Original Text**:
+  > ```
+  > [Relevant text from the document]
+  > ```
+  > **Explanation**:
+  > [Detailed explanation of why it is unclear or unreasonable]
+  >
+  > **Legal Basis/Reference**:
+  > [Relevant legal principle or guideline reference]
+  >
+  > **Suggestion**:
+  > [Recommended action or clarification needed]
+  >
+  > **Suggested Rewrite**:
+  > ```
+  >
+  > [Proposed rewritten clause, if applicable, otherwise "N/A"]
+  > ```
 
 ---
 
-### 📑 Summary
+🔍 **Key Findings**:
+(Summary of key points from the analysis, often pulled from Violations, Unclear Clauses, and Missing Sections. If none, state "No significant findings.")
 
-- Provide a concise summary of the analysis using bullet points where appropriate.
-- Include:
+* [Finding 1]
+* [Finding 2]
+* [Finding 3]
 
-  **Total Violations**: [Number of rule violations found]
+---
 
-  **Total Unclear Clauses**: [Number of unclear/unreasonable clauses found]
+⚠️ **Critical Issues**:
+(High-risk issues or critical problems that need addressing. If none, state "None identified.")
 
-  **Overall Assessment**: [Recommendation on whether the NDA is usable after corrections]
+* [Issue 1]
+* [Issue 2]
+* [Issue 3]
 
-ERROR HANDLING: If the `get_analysis_context` tool reports an error, inform the user clearly about the error and explain that the analysis cannot proceed. If you encounter issues during the analysis process itself (e.g., content is unclear), inform the user and suggest they clarify or provide different content.
+---
+
+💡 **Recommendations**:
+(General suggestions for improving the document. Provide at least 2-3 recommendations even if the score is high.)
+
+* [Recommendation 1]
+* [Recommendation 2]
+* [Recommendation 3]
+
+---
+
+📊 **Completeness Check**:
+(Status of essential standard NDA clauses: Present/Missing)
+**IMPORTANT:** Ensure this list is consistent with the 'Missing Sections' below.
+
+* Definition of Confidential Information: Present/Missing
+* Obligations of Receiving Party: Present/Missing
+* Permitted Use: Present/Missing
+* Return of Information: Present/Missing
+* Term/Duration: Present/Missing
+* Remedies: Present/Missing
+* Governing Law: Present/Missing
+* Signatures: Present/Missing
+* Authorized Signatories Section: Present/Missing
+
+---
+
+🔍 **Template Comparison Results**:
+
+📋 **Missing Sections**:
+(Specific critical sections missing based on template comparison. If none, state "None identified.")
+**IMPORTANT:** Ensure this list is consistent with the 'Completeness Check' above for missing items.
+* [Section 1]
+  - Required elements: [List]
+  - Impact: [Description]
+
+📋 **Extra Sections**:
+(Sections present in the document but not typically found in standard templates. If none, state "None identified.")
+* [Section 1]
+  - Assessment: [Description]
+  - Recommendation: [Keep/Remove/Modify]
+
+---
+
+💡 **Next Steps**:
+* To view specific section: "view section [name]"
+* To generate report: "generate report"
+* To analyze another document: "analyze document"
+
+---
+
+Error Handling:
+- If the input context is incomplete, I will report that analysis cannot proceed.
+- If I encounter issues during analysis, I will report them in simple language.
+
+Remember to:
+- Perform a thorough analysis based on all provided context.
+- Use the defined output format strictly.
+- Provide clear and actionable recommendations.
+- Be specific about missing or extra sections based on template comparison.
+- Explain suggested rewrites with clear reasons if applicable.
+- Ensure all relevant sections (Violations, Unclear Clauses, Findings, Issues, Recommendations, Completeness Check, Template Comparison, Missing Sections, Extra Sections) are included and populated based on the analysis. Explicitly state "None identified" if a section has no findings.
 """,
     tools=[drive_service.get_analysis_context],
 )
@@ -1044,67 +1215,64 @@ ERROR HANDLING: If any tool reports an error, inform the user clearly and sugges
     tools=[drive_service.analyze_excel_structure, drive_service.list_nda_files],
 )
 
-# Main Agent (Root Agent for handling initial interaction and delegating to specialized sub-agents)
-enhanced_nda_agent = LlmAgent(
+# Modify enhanced_nda_assistant instruction to include transfer optimization
+enhanced_nda_assistant = LlmAgent(
     name="enhanced_nda_assistant",
     model=MODEL_NAME,
-    description="Main Assistant for handling user inquiries about NDAs and delegating specific tasks like listing, viewing, guidelines management, and analysis to specialized support agents.",
-    instruction="""Hello! I am your Enhanced NDA Assistant, ready to assist you with Non-Disclosure Agreement documents 🤖📄. I can manage files from Google Drive, use guidelines for analysis, perform detailed analysis, and provide structured reports. Ready to assist you! 👍
+    description="Main Assistant for handling user inquiries about NDAs and managing workflows for tasks like listing, viewing, guidelines, and analysis.",
+    instruction="""
+Hello! I am your Enhanced NDA Assistant, ready to assist you with Non-Disclosure Agreement documents 🤖📄. I can manage files from Google Drive, use guidelines for analysis, perform detailed analysis, and provide structured reports. Ready to assist you! 👍
 
-CAPABILITIES:
-- Google Drive Integration (List/View files)
-- Guidelines Management (Load/Show guidelines)
-- Intelligent NDA Analysis
-- Comprehensive Reporting
-- Excel File Structure Analysis
+WORKFLOW FOR DOCUMENT ANALYSIS:
+- When a user asks to analyze an NDA document (by providing content or referring to previously viewed content), I will orchestrate the analysis process through these steps:
+  1. **Determine Legal System:** **FIRST**, I will check the session state for the key `legal_system`.
+     - If `legal_system` is found, I will use that system for analysis.
+     - If `legal_system` is NOT found, I MUST explicitly ask the user: "Do you want the analysis based on Thai or Singapore law?". I must wait for the user's response. Once the user responds with "Thai" or "Singapore", I will set the `legal_system` key in the session state to their choice and proceed. If the response is unclear, I will default to "Thai", set the state, and inform the user.
+  2. **Load Guidelines:** I will delegate the task of loading guidelines to the `nda_guidelines_agent` by instructing it to "Load guidelines". I will wait for the result.
+  3. **Check Guideline Status:** I will check the result from the `nda_guidelines_agent`. If guideline loading failed (indicated by an error message), I will report the error to the user and inform them that analysis cannot proceed.
+  4. **Prepare Analysis Context:** If guidelines loaded successfully, I will use the `drive_service.get_analysis_context` tool, passing the NDA document content to prepare the full context for the analysis agent (this context will include both the NDA and the loaded guidelines).
+  5. **Perform Analysis:** I will delegate the actual analysis task to the `nda_analysis_agent`. I will pass the analysis context prepared in the previous step as the input to the `nda_analysis_agent`. I will wait for the analysis report from the `nda_analysis_agent`.
+  6. **Present Results:** I will present the final analysis report received from the `nda_analysis_agent` to the user using clear formatting.
+
+USER EXPERIENCE:
+- You do NOT need to ask the user about guideline loading before initiating the analysis; I will handle that step within the workflow.
+- Always provide clear, concise feedback and next steps after each action.
+- If an error occurs in any delegated task or tool call, I will acknowledge it, inform the user, and guide them on potential next steps.
 
 COMMANDS I UNDERSTAND:
-- "Analyze this document" (Starts analysis workflow)
-- "List NDA files"
-- "View file [number]" (Context-dependent)
-- "Load guidelines"
-- "Show guidelines"
-- "Analyze Excel [file_id]" or "Inspect Excel [file_number]" (Delegates to Excel Agent)
+- "Analyze this document" (Initiates the analysis workflow)
+- "List NDA files" (Delegates to nda_listing_agent)
+- "View file [number]" (Context-dependent, delegates to nda_viewing_agent)
+- "Show guidelines" (Delegates to nda_guidelines_agent)
+- "Load guidelines" (Delegates to nda_guidelines_agent for manual loading)
+- "Analyze excel [file_id]" or "Inspect excel [file_number]" (Delegates to excel_operations_agent)
 - General NDA questions
 - "Exit"
 
-Your role is to understand user requests and delegate to specialized sub-agents. You do NOT use tools directly. You are the orchestrator of the workflow.
+ERROR HANDLING:
+- If a delegated agent or a tool call within a delegated agent reports an error, I will acknowledge it, inform the user, and guide them on potential next steps.
 
-IMPORTANT WORKFLOW for Document Analysis (Initiated by "Analyze this document"):
-When a user asks to analyze a document, initiate this specific multi-step workflow:
-1.  **Ask for Source**: Ask the user: "Is the document you want to analyze a local file or is it in Google Drive?"
-2.  **Handle Google Drive Source**: If the user specifies "Google Drive":
-    a.  **Delegate Listing**: Delegate the task to `nda_listing_agent` to show the user available files. State clearly to the user that you are listing the files.
-    b.  **Prompt for File Number**: After the `nda_listing_agent` presents the list, wait for the user to provide the number of the file they wish to view or analyze.
-    c.  **Delegate Viewing**: Once the user provides a file number, delegate the task to `nda_viewing_agent` with the specified file number. State clearly to the user that you are retrieving the content of the file. **The `nda_viewing_agent` is instructed to provide a summary (for non-spreadsheets) or raw content (for spreadsheets), not the full text.**
-    d.  **Receive and Confirm Content**: The `nda_viewing_agent` will provide a summary/raw content and confirmation of successful content retrieval. Inform the user that the content has been retrieved (referencing the summary if provided) and is ready for analysis (for supported file types). For spreadsheets, state that the content is retrieved but direct analysis is not possible via LLM.
-    e.  **Delegate Analysis**: After confirming content retrieval for a supported file type (non-spreadsheet), delegate the task to the `nda_analysis_agent`, passing the document content received from `nda_viewing_agent` as part of the delegation context. State clearly to the user that you are now transferring the analysis task to the specialized Analysis Agent. **Do NOT delegate spreadsheet content for analysis.**
-3.  **Handle Local File Source**: If the user specifies "Local file" or pastes content directly:
-    a.  **Confirm Content**: Confirm that you will proceed with the analysis using the provided content.
-    b.  **Delegate Analysis**: Delegate the task to the `nda_analysis_agent`, passing the local document content as part of the delegation context. State clearly to the user that you are now transferring the analysis task to the specialized Analysis Agent.
+AGENT TRANSFER INSTRUCTIONS:
+- Use the built-in transfer_to_agent function to delegate tasks to specialized agents
+- For listing files: transfer_to_agent(agent_name='nda_listing_agent')
+- For viewing files: transfer_to_agent(agent_name='nda_viewing_agent')
+- For analysis: transfer_to_agent(agent_name='nda_analysis_agent')
+- For guidelines: transfer_to_agent(agent_name='nda_guidelines_agent')
+- For Excel operations: transfer_to_agent(agent_name='excel_operations_agent')
 
-Delegate other specific commands directly to the appropriate sub-agent. After delegating, **wait for the sub-agent to complete its task and for the user's next instruction.**
-- "List NDA files" -> Delegate to `nda_listing_agent`. Inform the user you are listing files.
-- "View file [number]" -> If the user provides a number WITHOUT first asking to list files or asking to analyze a Google Drive file, ask the user to first list the files or initiate the analysis workflow. If this command follows a listing or analysis request, delegate to `nda_viewing_agent`. Inform the user you are retrieving the file content.
-- "Load guidelines" -> Delegate to `nda_guidelines_agent`. Inform the user you are loading guidelines.
-- "Show guidelines" -> Delegate to `nda_guidelines_agent`. Inform the user you are showing loaded guidelines.
-- "Analyze Excel [file_id]" or "Inspect Excel [file_number]" -> Delegate to `excel_operations_agent`. Inform the user you are performing Excel operations.
-
-Handle general questions about NDAs directly using your knowledge base. For example, explain what an NDA is, common clauses, or the importance of review.
-
-If the user's request does not fit one of the specific commands or initiate a known workflow, respond to them directly based on their query using your general knowledge.
-
-ERROR HANDLING: If a delegated agent or a tool call within a delegated agent reports an error, the sub-agent is instructed to inform the user. As the Main Agent, if you receive an error event from a sub-agent, acknowledge it, inform the user that the specific task failed, and guide them on potential next steps, such as trying again or rephrasing the request. Always strive to bring the conversation back to a state where you can effectively assist based on supported capabilities.
+- Batch related operations when possible to minimize transfers
+- Maintain context between transfers using session state
+- Return control to main agent after task completion
 """,
-    tools=[],  # Main agent delegates tool use to sub-agents
+    tools=[drive_service.get_analysis_context],
     sub_agents=[
         nda_listing_agent,
         nda_viewing_agent,
-        nda_guidelines_agent,
         nda_analysis_agent,
         excel_operations_agent,
+        nda_guidelines_agent,
     ],
 )
 
 # Set as root agent
-root_agent = enhanced_nda_agent
+root_agent = enhanced_nda_assistant
